@@ -53,17 +53,15 @@ def _send(stage):
     return [("send", f"out(rows{stage})", stage)]
 
 
-def test_forward_follows_attention_dbo_order_then_joins_lanes():
-    """For layers (1, 3) and stages (0, 1) the FFN issues Attention's DBO
-    micro-batch order: both stages dispatch layer 1, then each stage sends
-    its layer-1 result just before dispatching layer 3, and the last results
-    go back at the end. Each recv runs that layer's experts; the lanes rejoin
-    once at the end.
+def test_forward_sends_each_stage_after_its_experts_then_joins_lanes():
+    """For layers (1, 3) and stages (0, 1) every stage is received, run and
+    sent back before the next stage is received; the lanes rejoin once at
+    the end.
 
-    Why: Attention's micro-batch threads issue D0 D1 C0 D0' C1 D1' and
-    dispatch/combine can block the host, so sending stage 0 right after its
-    experts (D0 C0 D1) hung every rank in the graph+DBO warmup. A CUDA-graph
-    capture also fails if forked lane streams are not joined.
+    Why: a result held until that stage's next receive waits behind the other
+    stage's receive, which blocks the host, so Attention's micro-batch sat idle
+    in every layer and DBO overlapped nothing. A CUDA-graph capture also fails
+    if forked lane streams are not joined.
     """
     runner = _runner()
 
@@ -72,12 +70,12 @@ def test_forward_follows_attention_dbo_order_then_joins_lanes():
     first, last = MOE_LAYERS
     expected = [
         *_recv_and_run(0, first),
+        *_send(0),
         *_recv_and_run(1, first),
-        *_send(0),
-        *_recv_and_run(0, last),
         *_send(1),
-        *_recv_and_run(1, last),
+        *_recv_and_run(0, last),
         *_send(0),
+        *_recv_and_run(1, last),
         *_send(1),
         ("sync",),
     ]

@@ -1070,8 +1070,8 @@ def run_ffn_dbo_layers(
     retain: bool = True,
     stretch_cycles: int = 0,
 ) -> FFNPipelineStep:
-    """FFN side in the routed runner's order: each stage's send waits until
-    just before that stage's next receive, then the lanes join.
+    """FFN side in the routed runner's order: each stage's send follows its
+    experts, then the lanes join.
 
     ``sleep_cycles`` stretches every E0 with a GPU sleep queued right after
     it on the caller stream, and records when C1 of the previous layer and
@@ -1088,15 +1088,9 @@ def run_ffn_dbo_layers(
     payloads: list[list[Any]] = [[None, None] for _ in range(num_layers)]
     outs: list[list[Any]] = [[None, None] for _ in range(num_layers)]
     timings: list[tuple[int, Any, Any]] = []
-    pending: dict[int, tuple[torch.Tensor, Any]] = {}
     c1_end = None
     for layer in range(num_layers):
         for stage in (0, 1):
-            if stage in pending:
-                connector.send_ffn_output(*pending.pop(stage))
-                if stage == 1 and sleep_cycles:
-                    c1_end = torch.cuda.Event(enable_timing=True)
-                    c1_end.record(connector.lane_streams[1])
             payload = connector.recv_attn_output(stage)
             out = connector.run_experts(payload, weights)
             if stretch_cycles:
@@ -1106,17 +1100,15 @@ def run_ffn_dbo_layers(
                 e0_end = torch.cuda.Event(enable_timing=True)
                 e0_end.record()
                 if layer > 0:
-                    timings.append((layer, None, e0_end))
-            if stage == 1 and sleep_cycles and layer > 0:
-                prev_layer, _, prev_e0 = timings[-1]
-                timings[-1] = (prev_layer, c1_end, prev_e0)
-            pending[stage] = (out, payload.context)
+                    timings.append((layer, c1_end, e0_end))
+            connector.send_ffn_output(out, payload.context)
+            if stage == 1 and sleep_cycles:
+                c1_end = torch.cuda.Event(enable_timing=True)
+                c1_end.record(connector.lane_streams[1])
             if retain:
                 payloads[layer][stage] = payload
                 outs[layer][stage] = out
             del payload, out
-    for stage in (0, 1):
-        connector.send_ffn_output(*pending.pop(stage))
     connector.synchronize_lanes()
     return FFNPipelineStep(payloads=payloads, outs=outs, timings=timings, start=start)
 
@@ -1125,7 +1117,8 @@ def dbo_pipeline_scenario(
     connector: Any, topology: M2NTopology, args: dict[str, Any]
 ) -> dict[str, Any]:
     """Several MoE layers in vLLM's two-micro-batch DBO order, with the FFN's
-    deferred sends, checked layer by layer; eager or captured and replayed.
+    sends after each experts launch, checked layer by layer; eager or captured
+    and replayed.
 
     Args: ``num_layers``, ``tokens`` (per Attention rank and stage),
     ``graph`` (capture once, replay ``replays`` times with fresh inputs) and,

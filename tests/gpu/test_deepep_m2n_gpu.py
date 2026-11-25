@@ -206,9 +206,9 @@ DBO_SLEEP_CYCLES = 10_000_000
 
 @pytest.mark.parametrize("payload_format", PAYLOADS, ids=["bf16", "fp8"])
 def test_dbo_pipeline_eager_lanes_do_not_wait_for_each_other(payload_format, tmp_path):
-    """Four MoE layers in vLLM's DBO order with the FFN's deferred sends; every
-    E0 on the FFN is stretched by a GPU sleep, and C1(L-1) must still finish
-    before the stretched E0(L).
+    """Four MoE layers in vLLM's DBO order with the FFN's send after each
+    experts launch; every E0 on the FFN is stretched by a GPU sleep, and
+    C1(L-1) must still finish before the stretched E0(L).
 
     Why: a lane's combine that waited for the other lane's experts serialized
     Attention and FFN compute, so DBO overlapped nothing.
